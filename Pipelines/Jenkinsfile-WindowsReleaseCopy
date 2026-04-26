@@ -1,0 +1,140 @@
+pipeline {
+    agent { label 'RSOFT_WIN_SERVER' }
+
+    environment {
+        SOURCE_ROOT = "\\\\10.0.10.100\\d\\TestRelease\\Rel_2026_3_1"
+        TARGET_BASE = "\\\\10.0.10.10\\Public\\Sayam\\Update Folder"
+    }
+
+    stages {
+        stage('Validate Network Access') {
+            steps {
+                powershell '''
+                    Write-Host "🔍 Checking network..."
+                    if (-not (Test-Path "$env:TARGET_BASE")) {
+                        throw "❌ Cannot access target path"
+                    }
+                    Write-Host "✅ Network OK"
+                '''
+            }
+        }
+
+        stage('Extract Version') {
+            steps {
+                powershell '''
+                    $source = "$env:SOURCE_ROOT"
+                    if ($source -match "Rel_(.*)$") {
+                        $version = $matches[1].Trim()
+                    } else {
+                        throw "❌ Version not found"
+                    }
+                    Set-Content release_version.txt $version
+                    Write-Host "📦 Version: $version"
+                '''
+            }
+        }
+
+        stage('Prepare Target') {
+            steps {
+                powershell '''
+                    $version = Get-Content release_version.txt
+                    $target = Join-Path $env:TARGET_BASE $version
+                    New-Item -ItemType Directory -Force -Path $target | Out-Null
+                    Write-Host "📂 Target Ready: $target"
+                '''
+            }
+        }
+
+        stage('Copy & Restructure') {
+            steps {
+                powershell '''
+                    $version = Get-Content release_version.txt
+                    $src = "$env:SOURCE_ROOT"
+                    $dst = Join-Path $env:TARGET_BASE $version
+
+                    function SafeCopy($source, $destination) {
+                        if (-not (Test-Path $source)) {
+                            Write-Host "⚠️ Skipping missing: $source"
+                            return
+                        }
+                        New-Item -ItemType Directory -Force -Path $destination | Out-Null
+                        robocopy "$source" "$destination" /E /Z /R:2 /W:2 /NFL /NDL /NP
+                        if ($LASTEXITCODE -ge 8) {
+                            throw "❌ Failed copy: $source"
+                        }
+                    }
+
+                    $mappings = @(
+                        @{ Src="OnnetWeb-AdminPanelConsole_Rel_$version"; Dst="AdminPanelConsole" },
+                        @{ Src="NewAPIForCP1_Rel_$version"; Dst="CollectionApp\\NewAPIForCP1" },
+                        @{ Src="LcoPanelMobApi-LcoApp-New_Rel_$version"; Dst="LCOApp\\NewLcoWcf" },
+                        @{ Src="MyCableTV-API_Rel_$version"; Dst="MyCableTvWithPaytv\\MyCableTV-API" },
+                        @{ Src="MycableTVWithPayTV_Rel_$version"; Dst="MyCableTvWithPaytv\\MyCableTvWithPaytv_Main" },
+                        @{ Src="PublicAPIWcf_Rel_$version"; Dst="MyCableTvWithPaytv\\PublicApi" },
+                        @{ Src="SMSAPIWcf_Rel_$version"; Dst="MyCableTvWithPaytv\\SMSApi" },
+                        @{ Src="OnnetWeb-OnNetSinglePlay_Rel_$version"; Dst="OnNetSinglePlay" }
+                    )
+
+                    foreach ($map in $mappings) {
+                        $srcPath = Join-Path $src $map.Src
+                        $dstPath = Join-Path $dst $map.Dst
+                        SafeCopy $srcPath $dstPath
+                    }
+
+                    # Collection APK
+                    $collectionApk = Join-Path $src "Collection-Application-New_Rel_$version\\RsoftCollectionApp.apk"
+                    $collectionDst = Join-Path $dst "CollectionApp\\APK"
+
+                    if (Test-Path $collectionApk) {
+                        New-Item -ItemType Directory -Force -Path $collectionDst | Out-Null
+                        Copy-Item $collectionApk $collectionDst -Force
+                        Write-Host "✅ Collection APK Copied"
+                    } else {
+                        Write-Host "⚠️ Collection APK missing"
+                    }
+
+                    # LCO APK
+                    $lcoApk = Join-Path $src "LcoAppNew_Rel_$version\\NewLcoApp.apk"
+                    $lcoApkDst = Join-Path $dst "LCOApp\\APK"
+
+                    if (Test-Path $lcoApk) {
+                        New-Item -ItemType Directory -Force -Path $lcoApkDst | Out-Null
+                        Copy-Item $lcoApk $lcoApkDst -Force
+                        Write-Host "✅ LCO APK Copied"
+                    } else {
+                        Write-Host "⚠️ LCO APK missing"
+                    }
+
+                    # EXE → ZIP ONLY + RENAME
+                    $exeSrc = Join-Path $src "OnnetEXE\\ZIP"
+                    $exeDst = Join-Path $dst "EXE"
+
+                    if (Test-Path $exeSrc) {
+                        New-Item -ItemType Directory -Force -Path $exeDst | Out-Null
+                        Get-ChildItem $exeSrc -Filter *.zip | ForEach-Object {
+                            $newName = $_.Name -replace "^Rel_\\d+_\\d+_\\d+_", ""
+                            Copy-Item $_.FullName (Join-Path $exeDst $newName) -Force
+                            Write-Host "📦 ZIP Copied: $newName"
+                        }
+                    } else {
+                        Write-Host "⚠️ EXE folder missing"
+                    }
+
+                    Write-Host "🎉 ALL COPY COMPLETED"
+                    exit 0
+                '''
+            }
+        }
+    }
+    post {
+        success {
+            powershell '''
+                $version = Get-Content release_version.txt
+                Write-Host "🚀 Deployment Ready at: \\\\10.0.10.10\\Public\\Sayam\\Update Folder\\$version"
+            '''
+        }
+        failure {
+            echo "❌ Pipeline Failed"
+        }
+    }
+}
