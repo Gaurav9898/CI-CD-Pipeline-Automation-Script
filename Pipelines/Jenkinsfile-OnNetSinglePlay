@@ -1,0 +1,171 @@
+pipeline {
+    agent { label 'RSOFT_WIN_SERVER' }
+
+    environment {
+        BUILD_ROOT = "D:\\JenkinsAgent\\workspace\\Build"   // Local build workspace
+        MSBUILD = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\MSBuild.exe"
+        NETWORK_PUBLISH = "\\\\RELIABLESERVER\\Application Hosted\\OnNet-App6_0_72"     // Network folder for final publish
+    }
+
+    stages {
+        stage('Stage 1: Build OnNetSinglePlayDas') {
+            steps {
+                dir('OnNetSinglePlayDas') {
+                    script {
+                        git url: 'https://github.com/ReliablesoftTech/OnnetWeb-OnNetSinglePlayDas.git',
+                            branch: 'develop',
+                            credentialsId: 'Github_Token'
+
+                        powershell '''
+                            $ErrorActionPreference = "Stop"
+                            $buildOutput = "$env:BUILD_ROOT\\OnNetSinglePlayDas"
+
+                            if (-not (Test-Path $buildOutput)) { New-Item -ItemType Directory -Force -Path $buildOutput | Out-Null }
+
+                            Write-Host "🧹 Cleaning bin/obj..."
+                            Get-ChildItem -Recurse -Directory | Where-Object { $_.Name -in @("bin","obj") } |
+                                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+                            Write-Host "⚙️ Building OnNetSinglePlayDas..."
+                            Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object {
+                                $proj = $_.FullName
+                                & $env:MSBUILD $proj /t:Build /p:Configuration=Release /p:DeployOnBuild=true /p:OutputPath=$buildOutput
+                                if ($LASTEXITCODE -ne 0) { throw "Build failed for $proj" }
+                            }
+
+                            Write-Host "✅ Stage 1 complete. DLLs stored locally at: $buildOutput"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Stage 2: Build OnNetSinglePlayLib (with DAS reference)') {
+            steps {
+                dir('OnNetSinglePlayLib') {
+                    script {
+                        git url: 'https://github.com/ReliablesoftTech/OnnetWeb-OnNetSinglePlayLib.git',
+                            branch: 'develop',
+                            credentialsId: 'Github_Token'
+
+                        powershell '''
+                            $ErrorActionPreference = "Stop"
+
+                            $buildOutput = "$env:BUILD_ROOT\\OnNetSinglePlayLib"
+                            if (-not (Test-Path $buildOutput)) { New-Item -ItemType Directory -Force -Path $buildOutput | Out-Null }
+
+                            $project = "OnNetSinglePlayLib\\OnNetSinglePlayLib.csproj"
+                            $dllPath = "$env:BUILD_ROOT\\OnNetSinglePlayDas\\OnNetSinglePlayDas.dll"
+
+                            if (-not (Test-Path $dllPath)) { throw "❌ Missing DLL: $dllPath" }
+
+                            [xml]$xml = Get-Content $project
+                            $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+                            $ns.AddNamespace("ns", $xml.Project.NamespaceURI)
+
+                            $itemGroup = $xml.Project.ItemGroup | Where-Object { $_.Reference } | Select-Object -First 1
+                            if (-not $itemGroup) {
+                                $itemGroup = $xml.CreateElement("ItemGroup", $xml.Project.NamespaceURI)
+                                $xml.Project.AppendChild($itemGroup) | Out-Null
+                            }
+
+                            $ref = $xml.CreateElement("Reference", $xml.Project.NamespaceURI)
+                            $ref.SetAttribute("Include", "OnNetSinglePlayDas")
+                            $hint = $xml.CreateElement("HintPath", $xml.Project.NamespaceURI)
+                            $hint.InnerText = $dllPath
+                            $ref.AppendChild($hint) | Out-Null
+                            $itemGroup.AppendChild($ref) | Out-Null
+                            $xml.Save($project)
+                            Write-Host "📦 Added reference to: $dllPath"
+
+                            Write-Host "🧹 Cleaning bin/obj..."
+                            Get-ChildItem -Recurse -Directory | Where-Object { $_.Name -in @("bin","obj") } |
+                                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+                            Write-Host "⚙️ Building OnNetSinglePlayLib..."
+                            & $env:MSBUILD $project /t:Build /p:Configuration=Release /p:DeployOnBuild=true /p:OutputPath=$buildOutput
+                            if ($LASTEXITCODE -ne 0) { throw "Build failed for OnNetSinglePlayLib" }
+
+                            Write-Host "✅ Stage 2 complete. DLLs stored locally at: $buildOutput"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Stage 3: Build & Publish OnNetSinglePlay (with Lib reference)') {
+            steps {
+                dir('OnNetSinglePlay') {
+                    script {
+                        git url: 'https://github.com/ReliablesoftTech/OnnetWeb-OnNetSinglePlay.git',
+                            branch: 'develop',
+                            credentialsId: 'Github_Token'
+
+                        powershell '''
+                            $ErrorActionPreference = "Stop"
+
+                            $localOutput = "$env:BUILD_ROOT\\OnNetSinglePlay"
+                            $networkOutput = "$env:NETWORK_PUBLISH"
+
+                            if (-not (Test-Path $localOutput)) { New-Item -ItemType Directory -Force -Path $localOutput | Out-Null }
+                            if (-not (Test-Path $networkOutput)) { New-Item -ItemType Directory -Force -Path $networkOutput | Out-Null }
+
+                            $project = "OnNetSinglePlay\\OnNetSinglePlay.csproj"
+                            $dllPath = "$env:BUILD_ROOT\\OnNetSinglePlayLib\\OnNetSinglePlayLib.dll"
+
+                            if (-not (Test-Path $dllPath)) { throw "❌ Missing DLL: $dllPath" }
+
+                            [xml]$xml = Get-Content $project
+                            $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+                            $ns.AddNamespace("ns", $xml.Project.NamespaceURI)
+
+                            $itemGroup = $xml.Project.ItemGroup | Where-Object { $_.Reference } | Select-Object -First 1
+                            if (-not $itemGroup) {
+                                $itemGroup = $xml.CreateElement("ItemGroup", $xml.Project.NamespaceURI)
+                                $xml.Project.AppendChild($itemGroup) | Out-Null
+                            }
+
+                            $ref = $xml.CreateElement("Reference", $xml.Project.NamespaceURI)
+                            $ref.SetAttribute("Include", "OnNetSinglePlayLib")
+                            $hint = $xml.CreateElement("HintPath", $xml.Project.NamespaceURI)
+                            $hint.InnerText = $dllPath
+                            $ref.AppendChild($hint) | Out-Null
+                            $itemGroup.AppendChild($ref) | Out-Null
+                            $xml.Save($project)
+                            Write-Host "📦 Added reference to: $dllPath"
+
+                            Write-Host "🧹 Cleaning bin/obj..."
+                            Get-ChildItem -Recurse -Directory | Where-Object { $_.Name -in @("bin","obj") } |
+                                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+                            Write-Host "⚙️ Building OnNetSinglePlay..."
+                            & $env:MSBUILD $project /t:Build /p:Configuration=Release /p:DeployOnBuild=true /p:OutputPath=$localOutput
+                            if ($LASTEXITCODE -ne 0) { throw "Build failed for OnNetSinglePlay" }
+
+                            Write-Host "📂 Copying build to network share..."
+                            $publishedPath = "$localOutput\\_PublishedWebsites\\OnNetSinglePlay"
+
+                            # Delete Web.config before copying
+                            $webConfig = Join-Path $publishedPath "Web.config"
+                            if (Test-Path $webConfig) {
+                                Remove-Item $webConfig -Force
+                                Write-Host "️ Deleted Web.config from publish folder."
+                            }
+
+                            Copy-Item -Path "$publishedPath\\*" -Destination $networkOutput -Recurse -Force
+
+                            Write-Host "✅ Stage 3 complete. Build saved locally: $localOutput"
+                            Write-Host "✅ Published to network: $networkOutput"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 All stages completed! Final OnNetSinglePlay build published to ${env.NETWORK_PUBLISH}"
+        }
+    }
+}
