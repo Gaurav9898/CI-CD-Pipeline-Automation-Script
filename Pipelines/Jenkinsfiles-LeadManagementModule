@@ -1,0 +1,75 @@
+pipeline {
+    agent { label 'QA' }
+
+    environment {
+        SERVER = 'ubuntu@100.48.126.221'
+        KEY_CREDENTIAL = 'aws-10048-ssh'
+        REPO_URL = 'https://github.com/YOUR_ORG/LeadManagementModule.git'
+        BRANCH = 'develop'
+        DEPLOY_DIR = '/home/ubuntu/LeadManagementModule'
+    }
+
+    stages {
+        stage('Deploy') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(credentialsId: "${KEY_CREDENTIAL}", keyFileVariable: 'SSH_KEY'),
+                    usernamePassword(credentialsId: 'Github_Token', usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')
+                ]) {
+                    sh """
+                        ssh -i \$SSH_KEY -o StrictHostKeyChecking=no \$SERVER bash -s -- \$GH_USER \$GH_TOKEN \$REPO_URL \$BRANCH \$DEPLOY_DIR << 'REMOTE'
+GH_USER=\$1
+GH_TOKEN=\$2
+REPO_URL=\$3
+BRANCH=\$4
+DEPLOY_DIR=\$5
+
+AUTH_URL=\$(echo \$REPO_URL | sed "s|https://|https://\${GH_USER}:\${GH_TOKEN}@|")
+
+if [ -d "\$DEPLOY_DIR/.git" ]; then
+  cd \$DEPLOY_DIR
+  git fetch origin
+  git checkout \$BRANCH
+  git reset --hard origin/\$BRANCH
+else
+  git clone -b \$BRANCH \$AUTH_URL \$DEPLOY_DIR
+  cd \$DEPLOY_DIR
+fi
+
+docker system prune -af --volumes
+
+cat > .env << 'EOF'
+NODE_ENV=production
+DB_HOST=172.17.0.1
+DB_PORT=16897
+DB_NAME=bms_lead_management
+DB_USERNAME=rsoftnetmanager
+DB_PASSWORD=Rel!@blE@1279#
+DB_SCHEMA=bms_lead_management
+TENANT_KEYS=demo,sales
+TENANT_DEMO_DB_NAME=demo_lead_management
+TENANT_DEMO_DB_SCHEMA=demo_lead_management
+TENANT_SALES_DB_NAME=sales_lead_management
+TENANT_SALES_DB_SCHEMA=sales_lead_management
+REACT_APP_TENANT_KEYS=demo,sales
+ADMIN_DEFAULT_PASSWORD=admin123
+BMS_GATEWAY_URL=http://10.0.10.212:13400/graphql
+BMS_BASIC_AUTH_USERNAME=\$\$2a\$\$12\$\$xegZisvP5CFD/PmwvVtQveZrLUYTL8wjBmr0PWpeaItC7Zg7sqLMK
+BMS_BASIC_AUTH_PASSWORD=\$\$2a\$\$12\$\$iJwfFV6k2uHYGOvK9dYnI.dQyOAvOJfa/vFwcRTZJVin.cU9OodXS
+BMS_LOGIN_USERNAME='#bmsautotest#'
+BMS_LOGIN_PASSWORD='#rha@rstpv#'
+BMS_ISP_CODE=bmsqa
+BMS_INTEGRATION_ENABLED=false
+REACT_APP_GRAPHQL_URI=http://100.48.126.221:6005/graphql
+EOF
+
+git checkout -- docker-compose.yml
+docker compose --env-file .env down
+docker compose --env-file .env up -d --build
+REMOTE
+                    """
+                }
+            }
+        }
+    }
+}
