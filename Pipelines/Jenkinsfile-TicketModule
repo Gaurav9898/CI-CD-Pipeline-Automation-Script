@@ -1,0 +1,70 @@
+pipeline {
+    agent { label 'QA' }
+
+    environment {
+        SERVER = 'ubuntu@100.48.126.221'
+        KEY_CREDENTIAL = 'aws-10048-ssh'
+        REPO_URL = 'https://github.com/YOUR_ORG/TicketModule.git'
+        BRANCH = 'develop'
+        DEPLOY_DIR = '/home/ubuntu/TicketModule'
+    }
+
+    stages {
+        stage('Deploy') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(credentialsId: "${KEY_CREDENTIAL}", keyFileVariable: 'SSH_KEY'),
+                    usernamePassword(credentialsId: 'Github_Token', usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')
+                ]) {
+                    sh """
+                        ssh -i \$SSH_KEY -o StrictHostKeyChecking=no \$SERVER bash -s -- \$GH_USER \$GH_TOKEN \$REPO_URL \$BRANCH \$DEPLOY_DIR << 'REMOTE'
+GH_USER=\$1
+GH_TOKEN=\$2
+REPO_URL=\$3
+BRANCH=\$4
+DEPLOY_DIR=\$5
+
+AUTH_URL=\$(echo \$REPO_URL | sed "s|https://|https://\${GH_USER}:\${GH_TOKEN}@|")
+
+if [ -d "\$DEPLOY_DIR/.git" ]; then
+  cd \$DEPLOY_DIR
+  git fetch origin
+  git checkout \$BRANCH
+  git reset --hard origin/\$BRANCH
+else
+  git clone -b \$BRANCH \$AUTH_URL \$DEPLOY_DIR
+  cd \$DEPLOY_DIR
+fi
+
+docker system prune -af --volumes
+
+cat > implementation/backend/.env << 'EOF'
+NODE_ENV=production
+DB_HOST=172.17.0.1
+DB_PORT=16897
+DB_NAME=ticketing_db
+DB_USERNAME=rsoftnetmanager
+DB_PASSWORD=Rel!@blE@1279#
+DB_SCHEMA=ticketing_db
+TENANT_KEYS=demo,support
+TENANT_DEMO_DB_NAME=demo_ticketing_db
+TENANT_DEMO_DB_SCHEMA=demo_ticketing_db
+TENANT_SUPPORT_DB_NAME=support_ticketing_db
+TENANT_SUPPORT_DB_SCHEMA=support_ticketing_db
+REACT_APP_TENANT_KEYS=demo,support
+ADMIN_DEFAULT_PASSWORD=admin123
+BMS_INTEGRATION_ENABLED=false
+REACT_APP_GRAPHQL_URI=http://100.48.126.221:6014/graphql
+EOF
+
+cd implementation
+git checkout -- docker-compose.yml
+docker compose down
+docker compose up -d --build
+REMOTE
+                    """
+                }
+            }
+        }
+    }
+}
