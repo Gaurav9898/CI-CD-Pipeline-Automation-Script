@@ -1,0 +1,184 @@
+pipeline {
+    agent { label 'RSOFT_WIN_SERVER' }
+
+    options {
+        timestamps()
+        timeout(time: 120, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Stage Source Locally') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    $ProgressPreference = "SilentlyContinue"
+
+                    $sourceRoot = "\\\\10.0.11.55\\Test"
+                    $sourceUser = "gaurav.jangid"
+                    $sourcePass = "Reliable@123#"
+                    $localRoot  = Join-Path $env:WORKSPACE "payload"
+
+                    Write-Host "Staging source to local workspace..."
+                    cmd /c "net use $sourceRoot /delete /y >nul 2>&1" | Out-Null
+                    cmd /c "net use $sourceRoot /user:$sourceUser $sourcePass /persistent:no"
+                    if ($LASTEXITCODE -ne 0) { throw "Unable to connect source share: $sourceRoot" }
+
+                    if (Test-Path $localRoot) { Remove-Item $localRoot -Recurse -Force }
+                    New-Item -ItemType Directory -Path $localRoot -Force | Out-Null
+
+                    robocopy "$sourceRoot" "$localRoot" /E /Z /R:2 /W:2 /NFL /NDL /NP
+                    if ($LASTEXITCODE -ge 8) { throw "Failed staging source from $sourceRoot" }
+
+                    cmd /c "net use $sourceRoot /delete /y >nul 2>&1" | Out-Null
+                    Write-Host "Local staging complete: $localRoot"
+                '''
+            }
+        }
+
+        stage('Deploy to 45 Server via WinRM') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+                    $ProgressPreference = "SilentlyContinue"
+
+                    $targetServer = "45.114.246.168"
+                    $targetUser   = "45.114.246.168\\administrator"
+                    $targetPass   = "ijnCjCA5VPyWChD3Q1Za"
+                    $winrmPort    = 58955
+                    $targetBase   = "D:\\TestingRelease"
+                    $sourceRoot   = Join-Path $env:WORKSPACE "payload"
+                    $pkgRoot      = Join-Path $env:WORKSPACE "_pkg"
+
+                    $modules = @(
+                        "AdminPanelConsole",
+                        "CollectionApp",
+                        "LCOApp",
+                        "MyCableTvWithPaytv",
+                        "OnNetSinglePlay",
+                        "EXE"
+                    )
+
+                    Write-Host "Precheck WinRM port ${winrmPort}..."
+                    $tcpClient = New-Object System.Net.Sockets.TcpClient
+                    $connectResult = $tcpClient.BeginConnect($targetServer, $winrmPort, $null, $null)
+                    $ok = $connectResult.AsyncWaitHandle.WaitOne(10000, $false)
+                    if (-not $ok -or -not $tcpClient.Connected) {
+                        $tcpClient.Close()
+                        throw "WinRM port ${winrmPort} not reachable on $targetServer (10s timeout)"
+                    }
+                    $tcpClient.Close()
+
+                    try {
+                        $trusted = (Get-Item WSMan:\\localhost\\Client\\TrustedHosts -ErrorAction Stop).Value
+                        if ([string]::IsNullOrWhiteSpace($trusted)) {
+                            Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value $targetServer -Force
+                        } elseif ($trusted -notmatch "(^|,\\s*)$([regex]::Escape($targetServer))(\\s*,|$)") {
+                            Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value "$trusted,$targetServer" -Force
+                        }
+                    } catch {
+                        Write-Host "TrustedHosts update skipped: $($_.Exception.Message)"
+                    }
+
+                    if (Test-Path $pkgRoot) { Remove-Item $pkgRoot -Recurse -Force }
+                    New-Item -Path $pkgRoot -ItemType Directory -Force | Out-Null
+
+                    $sec  = ConvertTo-SecureString $targetPass -AsPlainText -Force
+                    $cred = New-Object System.Management.Automation.PSCredential($targetUser, $sec)
+                    $opt  = New-PSSessionOption -OpenTimeout 30000 -OperationTimeout 600000
+
+                    Write-Host "Connecting WinRM session..."
+                    $s = New-PSSession -ComputerName $targetServer -Port $winrmPort -Credential $cred -Authentication Negotiate -SessionOption $opt
+
+                    try {
+                        $version = Invoke-Command -Session $s -ArgumentList $targetBase -ScriptBlock {
+                            param($dstBase)
+                            if (-not (Test-Path $dstBase)) { New-Item -Path $dstBase -ItemType Directory -Force | Out-Null }
+                            $v = Get-Date -Format "yyyy_MM_dd_HHmm"
+                            $dst = Join-Path $dstBase $v
+                            New-Item -Path $dst -ItemType Directory -Force | Out-Null
+                            return $v
+                        }
+
+                        $remoteRoot = Join-Path $targetBase $version
+                        $remoteTmp  = Join-Path $targetBase ("_incoming_" + $version)
+
+                        Invoke-Command -Session $s -ArgumentList $remoteTmp -ScriptBlock {
+                            param($p)
+                            if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+                            New-Item -Path $p -ItemType Directory -Force | Out-Null
+                        }
+
+                        Write-Host "Version: $version"
+                        Write-Host "Remote root: $remoteRoot"
+
+                        # WinRM smoke test
+                        $probe = Join-Path $env:WORKSPACE "_probe.txt"
+                        "probe $(Get-Date)" | Set-Content $probe
+                        Copy-Item -Path $probe -Destination (Join-Path $remoteTmp "_probe.txt") -ToSession $s -Force
+                        Remove-Item $probe -Force
+
+                        foreach ($m in $modules) {
+                            $localModule = Join-Path $sourceRoot $m
+                            if (-not (Test-Path $localModule)) {
+                                Write-Host "Skip missing: $m"
+                                continue
+                            }
+
+                            $zip = Join-Path $pkgRoot ($m + ".zip")
+                            if (Test-Path $zip) { Remove-Item $zip -Force }
+
+                            Write-Host "Packing: $m"
+                            Compress-Archive -Path (Join-Path $localModule "*") -DestinationPath $zip -Force
+                            $size = [Math]::Round((Get-Item $zip).Length / 1MB, 2)
+                            Write-Host "Packed $m = ${size} MB"
+
+                            $remoteZip = Join-Path $remoteTmp ($m + ".zip")
+                            $remoteDst = Join-Path $remoteRoot $m
+
+                            Write-Host "Uploading: $m"
+                            Copy-Item -Path $zip -Destination $remoteZip -ToSession $s -Force
+
+                            Write-Host "Expanding: $m"
+                            Invoke-Command -Session $s -ArgumentList $remoteZip, $remoteDst -ScriptBlock {
+                                param($z, $d)
+                                if (Test-Path $d) { Remove-Item $d -Recurse -Force }
+                                New-Item -Path $d -ItemType Directory -Force | Out-Null
+                                Expand-Archive -Path $z -DestinationPath $d -Force
+                                Remove-Item $z -Force -ErrorAction SilentlyContinue
+                            }
+
+                            Write-Host "Done: $m"
+                        }
+
+                        # EXE rename rule
+                        Invoke-Command -Session $s -ArgumentList (Join-Path $remoteRoot "EXE") -ScriptBlock {
+                            param($exePath)
+                            if (Test-Path $exePath) {
+                                Get-ChildItem -Path $exePath -Filter *.zip -ErrorAction SilentlyContinue | ForEach-Object {
+                                    $newName = $_.Name -replace "^Rel_\\d+_\\d+_\\d+_", ""
+                                    if ($newName -ne $_.Name) { Rename-Item $_.FullName -NewName $newName -Force }
+                                }
+                            }
+                        }
+
+                        Invoke-Command -Session $s -ArgumentList $remoteTmp -ScriptBlock {
+                            param($p)
+                            if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+                        }
+
+                        Set-Content -Path (Join-Path $env:WORKSPACE "release_version.txt") -Value $version
+                        Write-Host "Deployment ready at: D:\\TestingRelease\\$version"
+                    }
+                    finally {
+                        if ($s) { Remove-PSSession $s }
+                        if (Test-Path $pkgRoot) { Remove-Item $pkgRoot -Recurse -Force -ErrorAction SilentlyContinue }
+                    }
+                '''
+            }
+        }
+    }
+
+    post {
+        failure { echo 'Pipeline Failed' }
+    }
+}
